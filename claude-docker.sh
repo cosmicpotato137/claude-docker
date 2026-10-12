@@ -15,7 +15,7 @@
 #       --recreate         Remove the existing container and create a new one
 #                          (needed to pick up a rebuilt image)
 #       --rm               One-off container, removed when the session exits
-#       --no-build         Don't rebuild the image first
+#       --build            Rebuild the image first
 #       --no-cache         Rebuild from scratch (picks up new claude/MCP releases)
 #   -h, --help             Show this help
 #
@@ -112,7 +112,7 @@ env_args=()
 claude_args=()
 workdir=/workspace
 name=""
-build=true
+build=false
 no_cache=false
 shell=false
 recreate=false
@@ -196,7 +196,7 @@ while [ $# -gt 0 ]; do
     --shell) shell=true; shift ;;
     --recreate) recreate=true; shift ;;
     --rm) ephemeral=true; shift ;;
-    --no-build) build=false; shift ;;
+    --build) build=true; shift ;;
     --no-cache) no_cache=true; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; claude_args+=("$@"); break ;;
