@@ -17,7 +17,8 @@
 #   -h, --help             Show this help
 #
 # DEST defaults to /workspace/<basename of PATH>; a relative DEST is placed
-# under /workspace. Directories mounted outside the working directory are passed
+# under /workspace. DEST must be /workspace or a path under /workspace or
+# /home/node. Directories mounted outside the working directory are passed
 # to claude with --add-dir. Arguments after `--` go to claude, e.g.
 #   ./claude-docker.sh -w ~/code/app -r ~/Documents/specs:specs -- --model opus
 #
@@ -25,30 +26,77 @@
 # starting with # are ignored; relative paths resolve against the file's
 # directory. See mounts.conf.example.
 #
+# Safety checks: only directories and regular files can be mounted. A
+# read-write mount may not overlap this script's directory or a mounts file in
+# use, since the host runs or reads those. No mount may pass through a symlink
+# inside a read-write mount, since an earlier session could have planted it.
+#
 # Auth: ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`)
 # and other ANTHROPIC_* settings are passed through when set, as is a .env file
-# next to this script. Otherwise run /login once inside the container. Auth,
-# settings and MCP state persist in the "claude-docker-config" volume.
+# next to this script. Otherwise run /login inside the container. Auth,
+# settings and MCP state persist in a config volume per mount set
+# (claude-docker-config-<hash>), so a session can't leave hooks or MCP servers
+# behind for a later session with different access. Put
+# CLAUDE_CODE_OAUTH_TOKEN in .env to avoid logging in once per mount set.
 #
 # Environment: CLAUDE_DOCKER_IMAGE (default: claude-docker),
-#              CLAUDE_DOCKER_VOLUME (default: claude-docker-config)
+#              CLAUDE_DOCKER_VOLUME (one config volume for every mount set;
+#              shares state between them)
 set -euo pipefail
-
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-image="${CLAUDE_DOCKER_IMAGE:-claude-docker}"
-volume="${CLAUDE_DOCKER_VOLUME:-claude-docker-config}"
-passthrough_env="ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN
-  ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL"
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 die() { echo "claude-docker: $*" >&2; exit 1; }
 need_arg() { [ $# -ge 2 ] || die "$1 requires an argument"; }
 
+# resolve PATH: print PATH as an absolute path with all symlinks resolved.
+resolve() {
+  local p="$1" target
+  while [ -L "$p" ]; do
+    target="$(readlink "$p")"
+    case "$target" in /*) p="$target" ;; *) p="$(dirname "$p")/$target" ;; esac
+  done
+  if [ -d "$p" ]; then
+    (cd "$p" && pwd -P)
+  else
+    echo "$(cd "$(dirname "$p")" && pwd -P)/$(basename "$p")"
+  fi
+}
+
+# is_within PATH DIR: true if PATH is DIR or inside it.
+is_within() {
+  [ "$2" = / ] || [ "$1" = "$2" ] || case "$1" in "$2"/*) true ;; *) false ;; esac
+}
+
+# no_symlinks_below DIR REL: die if any component of DIR/REL below DIR is a
+# symlink.
+no_symlinks_below() {
+  local path="$1" part parts
+  IFS=/ read -r -a parts <<< "$2"
+  for part in "${parts[@]}"; do
+    path="$path/$part"
+    [ ! -L "$path" ] || die "$path is a symlink inside a read-write mount; refusing to mount through it"
+  done
+}
+
+sha256() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
+
+script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+script_dir="$(dirname "$(resolve "$script")")"
+image="${CLAUDE_DOCKER_IMAGE:-claude-docker}"
+passthrough_env="ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL"
+
 mount_args=()
+mount_srcs=()   # host paths, symlinks resolved
+mount_given=()  # host paths as given (absolute, symlinks not resolved)
 mount_dests=()
+mount_modes=()
 mount_dirs=()
 mount_summary=()
 mounts_files=()
+# Host paths a container must not be able to write: this script (and the path
+# it was invoked by) and its directory, plus the mounts files in use.
+protected_paths=("$script_dir" "$script")
 env_args=()
 claude_args=()
 workdir=/workspace
@@ -60,7 +108,7 @@ shell=false
 # add_mount MODE PATH[:DEST] [BASE_DIR]
 # Relative PATHs resolve against BASE_DIR (default: the current directory).
 add_mount() {
-  local mode="$1" spec="$2" base="${3:-$PWD}" src dest d
+  local mode="$1" spec="$2" base="${3:-$PWD}" src given dest d
   case "$mode" in ro|rw) ;; *) die "invalid mode '$mode' (expected ro or rw)" ;; esac
 
   src="${spec%%:*}"
@@ -73,22 +121,32 @@ add_mount() {
     *) src="$base/$src" ;;
   esac
   [ -e "$src" ] || die "path does not exist: $src"
-  if [ -d "$src" ]; then
-    src="$(cd "$src" && pwd -P)"
-  else
-    src="$(cd "$(dirname "$src")" && pwd -P)/$(basename "$src")"
-  fi
+  given="$src"
+  src="$(resolve "$src")"
+  # No sockets (e.g. docker.sock) or devices.
+  [ -d "$src" ] || [ -f "$src" ] || die "only directories and regular files can be mounted: $src"
 
   [ -n "$dest" ] || dest="$(basename "$src")"
   case "$dest" in /*) ;; *) dest="/workspace/$dest" ;; esac
+  dest="$(printf '%s' "$dest" | tr -s /)"
   [ "$dest" = "/" ] || dest="${dest%/}"
   case "$dest" in *:*) die "container path may not contain ':': $dest" ;; esac
+  case "$dest/" in */./*|*/../*) die "container path may not contain . or ..: $dest" ;; esac
+  # Keep image paths (e.g. /etc/claude-code/managed-settings.json) intact.
+  case "$dest" in
+    /workspace|/workspace/*|/home/node/?*) ;;
+    *) die "container path must be /workspace or under /workspace or /home/node: $dest" ;;
+  esac
+  [ "$dest" != /home/node/.claude ] || die "$dest is reserved for the config volume"
   for d in ${mount_dests[@]+"${mount_dests[@]}"}; do
     [ "$d" != "$dest" ] || die "two mounts map to $dest; give one an explicit DEST (PATH:DEST)"
   done
 
   mount_args+=(-v "$src:$dest:$mode")
+  mount_srcs+=("$src")
+  mount_given+=("$given")
   mount_dests+=("$dest")
+  mount_modes+=("$mode")
   if [ -d "$src" ]; then mount_dirs+=("$dest"); fi
   mount_summary+=("  $mode  $src -> $dest")
 }
@@ -97,12 +155,21 @@ read_mounts_file() {
   local file="$1" base mode spec line_no=0
   [ -f "$file" ] || die "mounts file not found: $file"
   base="$(cd "$(dirname "$file")" && pwd -P)"
+  protected_paths+=("$base/$(basename "$file")" "$(resolve "$file")")
   while read -r mode spec || [ -n "$mode" ]; do
     line_no=$((line_no + 1))
     case "$mode" in ""|"#"*) continue ;; esac
     [ -n "$spec" ] || die "$file:$line_no: expected '<ro|rw> PATH[:DEST]'"
     add_mount "$mode" "$spec" "$base"
   done < "$file"
+}
+
+# Hash of the mount set, used to name its config volume.
+mount_set_hash() {
+  local i
+  for ((i = 0; i < ${#mount_srcs[@]}; i++)); do
+    echo "${mount_modes[i]} ${mount_srcs[i]} ${mount_dests[i]}"
+  done | LC_ALL=C sort | sha256 | cut -c1-12
 }
 
 while [ $# -gt 0 ]; do
@@ -128,6 +195,37 @@ fi
 for f in ${mounts_files[@]+"${mounts_files[@]}"}; do
   read_mounts_file "$f"
 done
+
+# Refuse to mount this script or the parent directory
+for ((i = 0; i < ${#mount_srcs[@]}; i++)); do
+  [ "${mount_modes[i]}" = rw ] || continue
+  for p in "${protected_paths[@]}"; do
+    if is_within "$p" "${mount_srcs[i]}" || is_within "${mount_srcs[i]}" "$p"; then
+      die "refusing to mount ${mount_srcs[i]} read-write: it overlaps $p, which the host uses to start containers (mount it read-only instead)"
+    fi
+  done
+done
+
+# An earlier session may have planted symlinks in a read-write mount, so don't
+# follow any on the way to a nested mount: neither on the host source path nor
+# on the mount point, which Docker creates inside the parent mount.
+for ((i = 0; i < ${#mount_srcs[@]}; i++)); do
+  for ((j = 0; j < ${#mount_srcs[@]}; j++)); do
+    [ "$i" != "$j" ] && [ "${mount_modes[j]}" = rw ] || continue
+    if is_within "${mount_dests[i]}" "${mount_dests[j]}"; then
+      no_symlinks_below "${mount_srcs[j]}" "${mount_dests[i]#"${mount_dests[j]}"/}"
+    fi
+    for p in "${mount_srcs[j]}" "${mount_given[j]}"; do
+      if [ "${mount_given[i]}" != "$p" ] && is_within "${mount_given[i]}" "$p"; then
+        no_symlinks_below "$p" "${mount_given[i]#"$p"/}"
+      fi
+    done
+  done
+done
+
+# One config volume per mount set: hooks, settings or MCP servers a session
+# writes there only reach later sessions with the same access.
+volume="${CLAUDE_DOCKER_VOLUME:-claude-docker-config-$(mount_set_hash)}"
 
 case "$workdir" in /*) ;; *) workdir="/workspace/$workdir" ;; esac
 [ "$workdir" = "/" ] || workdir="${workdir%/}"
@@ -158,7 +256,10 @@ if $build; then
   docker build "${build_args[@]}" "$script_dir" >/dev/null
 fi
 
-run_args=(--rm --init --name "$name" -w "$workdir" -v "$volume:/home/node/.claude")
+# The container needs no capabilities or setuid binaries; the PID limit stops
+# runaway process trees from starving the Docker VM.
+run_args=(--rm --init --name "$name" -w "$workdir" -v "$volume:/home/node/.claude"
+  --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=1024)
 if [ -t 0 ] && [ -t 1 ]; then run_args+=(-it); else run_args+=(-i); fi
 for var in $passthrough_env; do
   if [ -n "${!var:-}" ]; then run_args+=(-e "$var"); fi
@@ -171,6 +272,7 @@ if [ ${#mount_summary[@]} -gt 0 ]; then
 else
   echo "claude-docker: starting container '$name' with no host mounts (see --help)" >&2
 fi
+echo "claude-docker: config volume '$volume'" >&2
 
 exec docker run "${run_args[@]}" \
   ${mount_args[@]+"${mount_args[@]}"} \
