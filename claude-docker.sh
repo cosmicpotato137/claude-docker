@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds the Claude Code image and starts a new container with host paths
-# mounted read-only or read-write.
+# Builds the Claude Code image and runs claude in a persistent container with
+# host paths mounted read-only or read-write.
 #
 # Usage: ./claude-docker.sh [options] [-- claude args...]
 #
@@ -9,12 +9,25 @@
 #   -m, --mounts FILE      Read mounts from FILE (repeatable). If no -r/-w/-m
 #                          is given, mounts.conf next to this script is used.
 #   -C, --workdir DIR      Working directory in the container (default: /workspace)
-#   -e, --env VAR[=VALUE]  Set an environment variable in the container (repeatable)
-#   -n, --name NAME        Container name (default: claude-<timestamp>)
+#   -e, --env VAR[=VALUE]  Set an environment variable for this session (repeatable)
+#   -n, --name NAME        Container name (default: claude-<mount set hash>)
 #       --shell            Start bash instead of claude
+#       --recreate         Remove the existing container and create a new one
+#                          (needed to pick up a rebuilt image)
+#       --rm               One-off container, removed when the session exits
 #       --no-build         Don't rebuild the image first
 #       --no-cache         Rebuild from scratch (picks up new claude/MCP releases)
 #   -h, --help             Show this help
+#
+# Container lifecycle: the first run creates a container that keeps running in
+# the background (and restarts with Docker) until you remove it with
+#   docker rm -f <name>
+# Each run of this script opens a new claude (or bash) session in it with
+# `docker exec`, so exiting the session leaves the container and anything
+# installed in it intact. Several sessions can run in it at once. The default
+# name is derived from the mount set, so running again with the same mounts
+# reuses the same container; mounts are fixed when the container is created,
+# so a different mount set gets a different container.
 #
 # DEST defaults to /workspace/<basename of PATH>; a relative DEST is placed
 # under /workspace. DEST must be /workspace or a path under /workspace or
@@ -32,12 +45,10 @@
 # inside a read-write mount, since an earlier session could have planted it.
 #
 # Auth: ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`)
-# and other ANTHROPIC_* settings are passed through when set, as is a .env file
-# next to this script. Otherwise run /login inside the container. Auth,
-# settings and MCP state persist in a config volume per mount set
-# (claude-docker-config-<hash>), so a session can't leave hooks or MCP servers
-# behind for a later session with different access. Put
-# CLAUDE_CODE_OAUTH_TOKEN in .env to avoid logging in once per mount set.
+# and other ANTHROPIC_* settings are passed to each session when set, as is a
+# .env file next to this script. Otherwise run /login inside the container. Auth, settings and MCP state persist in a
+# config volume per mount set (claude-docker-config-<hash>), so a session can't
+# leave hooks or MCP servers behind for a later session with different access.
 #
 # Environment: CLAUDE_DOCKER_IMAGE (default: claude-docker),
 #              CLAUDE_DOCKER_VOLUME (one config volume for every mount set;
@@ -100,10 +111,12 @@ protected_paths=("$script_dir" "$script")
 env_args=()
 claude_args=()
 workdir=/workspace
-name="claude-$(date +%Y%m%d-%H%M%S)"
+name=""
 build=true
 no_cache=false
 shell=false
+recreate=false
+ephemeral=false
 
 # add_mount MODE PATH[:DEST] [BASE_DIR]
 # Relative PATHs resolve against BASE_DIR (default: the current directory).
@@ -164,7 +177,7 @@ read_mounts_file() {
   done < "$file"
 }
 
-# Hash of the mount set, used to name its config volume.
+# Hash of the mount set, used to name its config volume and container.
 mount_set_hash() {
   local i
   for ((i = 0; i < ${#mount_srcs[@]}; i++)); do
@@ -181,6 +194,8 @@ while [ $# -gt 0 ]; do
     -e|--env) need_arg "$@"; env_args+=(-e "$2"); shift 2 ;;
     -n|--name) need_arg "$@"; name="$2"; shift 2 ;;
     --shell) shell=true; shift ;;
+    --recreate) recreate=true; shift ;;
+    --rm) ephemeral=true; shift ;;
     --no-build) build=false; shift ;;
     --no-cache) no_cache=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -223,9 +238,15 @@ for ((i = 0; i < ${#mount_srcs[@]}; i++)); do
   done
 done
 
+mounts_hash="$(mount_set_hash)"
+
 # One config volume per mount set: hooks, settings or MCP servers a session
 # writes there only reach later sessions with the same access.
-volume="${CLAUDE_DOCKER_VOLUME:-claude-docker-config-$(mount_set_hash)}"
+volume="${CLAUDE_DOCKER_VOLUME:-claude-docker-config-$mounts_hash}"
+
+if [ -z "$name" ]; then
+  if $ephemeral; then name="claude-$(date +%Y%m%d-%H%M%S)"; else name="claude-$mounts_hash"; fi
+fi
 
 case "$workdir" in /*) ;; *) workdir="/workspace/$workdir" ;; esac
 [ "$workdir" = "/" ] || workdir="${workdir%/}"
@@ -258,23 +279,61 @@ fi
 
 # The container needs no capabilities or setuid binaries; the PID limit stops
 # runaway process trees from starving the Docker VM.
-run_args=(--rm --init --name "$name" -w "$workdir" -v "$volume:/home/node/.claude"
-  --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=1024)
-if [ -t 0 ] && [ -t 1 ]; then run_args+=(-it); else run_args+=(-i); fi
+container_args=(--init --name "$name" -w "$workdir" -v "$volume:/home/node/.claude"
+  --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=1024
+  --label "claude-docker.mounts=$mounts_hash")
+
+# Per-session settings: terminal, working directory and environment.
+session_args=()
+if [ -t 0 ] && [ -t 1 ]; then session_args+=(-it); else session_args+=(-i); fi
 for var in $passthrough_env; do
-  if [ -n "${!var:-}" ]; then run_args+=(-e "$var"); fi
+  if [ -n "${!var:-}" ]; then session_args+=(-e "$var"); fi
 done
-if [ -f "$script_dir/.env" ]; then run_args+=(--env-file "$script_dir/.env"); fi
+if [ -f "$script_dir/.env" ]; then session_args+=(--env-file "$script_dir/.env"); fi
+session_args+=(${env_args[@]+"${env_args[@]}"})
 
-if [ ${#mount_summary[@]} -gt 0 ]; then
-  echo "claude-docker: starting container '$name' with mounts:" >&2
-  printf '%s\n' "${mount_summary[@]}" >&2
-else
-  echo "claude-docker: starting container '$name' with no host mounts (see --help)" >&2
+print_mounts() {
+  if [ ${#mount_summary[@]} -gt 0 ]; then
+    echo "claude-docker: $1 '$name' with mounts:" >&2
+    printf '%s\n' "${mount_summary[@]}" >&2
+  else
+    echo "claude-docker: $1 '$name' with no host mounts (see --help)" >&2
+  fi
+  echo "claude-docker: config volume '$volume'" >&2
+}
+
+# One-off container, removed on exit
+if $ephemeral; then
+  print_mounts "starting one-off container"
+  exec docker run --rm "${container_args[@]}" "${session_args[@]}" \
+    ${mount_args[@]+"${mount_args[@]}"} "$image" "${cmd[@]}"
 fi
-echo "claude-docker: config volume '$volume'" >&2
 
-exec docker run "${run_args[@]}" \
-  ${mount_args[@]+"${mount_args[@]}"} \
-  ${env_args[@]+"${env_args[@]}"} \
-  "$image" "${cmd[@]}"
+container_exists() { docker container inspect "$name" >/dev/null 2>&1; }
+
+if container_exists && $recreate; then
+  echo "claude-docker: removing container '$name'..." >&2
+  docker rm -f "$name" >/dev/null
+fi
+
+if container_exists; then
+  # Mounts are fixed at creation, so only reuse a container with the same set.
+  existing="$(docker container inspect -f '{{index .Config.Labels "claude-docker.mounts"}}' "$name")"
+  [ "$existing" = "$mounts_hash" ] ||
+    die "container '$name' exists with a different mount set; pass --recreate to replace it or -n to use another name"
+  if [ "$(docker container inspect -f '{{.Image}}' "$name")" != "$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null)" ]; then
+    echo "claude-docker: note: '$name' uses an older '$image' image; pass --recreate to switch to the new one" >&2
+  fi
+  echo "claude-docker: using existing container '$name'" >&2
+else
+  print_mounts "creating container"
+  # A placeholder main process keeps the container running between sessions.
+  docker create --restart unless-stopped "${container_args[@]}" \
+    ${mount_args[@]+"${mount_args[@]}"} "$image" sleep infinity >/dev/null
+fi
+
+if [ "$(docker container inspect -f '{{.State.Running}}' "$name")" != true ]; then
+  docker start "$name" >/dev/null
+fi
+
+exec docker exec -w "$workdir" "${session_args[@]}" "$name" "${cmd[@]}"
