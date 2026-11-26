@@ -35,3 +35,5 @@ ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) and other
 this script, symlinks followed)
 - `CLAUDE_DOCKER_IMAGE` (default: `claude-docker`)
 - `CLAUDE_DOCKER_VOLUME` (records auth and mounts between sessions)
+
+See .env.example for more information.
