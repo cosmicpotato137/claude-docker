@@ -1,62 +1,26 @@
 #!/usr/bin/env bash
-# Builds the Claude Code image and runs claude in a persistent container with
-# host paths mounted read-only or read-write.
+# Run Claude Code in a persistent Docker container tied specific folders
+# or files, mounted as read-only or read-write.
 #
-# Usage: ./claude-docker.sh [options] [-- claude args...]
+# Usage: claude-docker [options] [-- claude args...]
 #
 #   -r, --ro PATH[:DEST]   Mount PATH read-only (repeatable)
 #   -w, --rw PATH[:DEST]   Mount PATH read-write (repeatable)
 #   -m, --mounts FILE      Read mounts from FILE (repeatable). If no -r/-w/-m
 #                          is given, mounts.conf next to this script is used.
 #   -C, --workdir DIR      Working directory in the container (default: /workspace)
-#   -e, --env VAR[=VALUE]  Set an environment variable for this session (repeatable)
-#   -n, --name NAME        Container name (default: claude-<mount set hash>)
+#   -e, --env VAR[=VALUE]  Set an environment variable in the container (repeatable)
+#   -n, --name NAME        Container name (default: claude-<folder>-<hash>)
 #       --shell            Start bash instead of claude
-#       --recreate         Remove the existing container and create a new one
-#                          (needed to pick up a rebuilt image)
-#       --rm               One-off container, removed when the session exits
+#       --rm               Start a new one-off container, removed on exit
 #       --build            Rebuild the image first
-#       --no-cache         Rebuild from scratch (picks up new claude/MCP releases)
+#       --no-cache         Start claude from scratch (picks up new claude/MCP releases)
 #   -h, --help             Show this help
-#
-# Container lifecycle: the first run creates a container that keeps running in
-# the background (and restarts with Docker) until you remove it with
-#   docker rm -f <name>
-# Each run of this script opens a new claude (or bash) session in it with
-# `docker exec`, so exiting the session leaves the container and anything
-# installed in it intact. Several sessions can run in it at once. The default
-# name is derived from the mount set, so running again with the same mounts
-# reuses the same container; mounts are fixed when the container is created,
-# so a different mount set gets a different container.
-#
-# DEST defaults to /workspace/<basename of PATH>; a relative DEST is placed
-# under /workspace. DEST must be /workspace or a path under /workspace or
-# /home/node. Directories mounted outside the working directory are passed
-# to claude with --add-dir. Arguments after `--` go to claude, e.g.
-#   ./claude-docker.sh -w ~/code/app -r ~/Documents/specs:specs -- --model opus
-#
-# Mounts file: one "<ro|rw> PATH[:DEST]" per line; blank lines and lines
-# starting with # are ignored; relative paths resolve against the file's
-# directory. See mounts.conf.example.
-#
-# Safety checks: only directories and regular files can be mounted. A
-# read-write mount may not overlap this script's directory or a mounts file in
-# use, since the host runs or reads those. No mount may pass through a symlink
-# inside a read-write mount, since an earlier session could have planted it.
-#
-# Auth: ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`)
-# and other ANTHROPIC_* settings are passed to each session when set, as is a
-# .env file next to this script. Otherwise run /login inside the container. Auth, settings and MCP state persist in a
-# config volume per mount set (claude-docker-config-<hash>), so a session can't
-# leave hooks or MCP servers behind for a later session with different access.
-#
-# Environment: CLAUDE_DOCKER_IMAGE (default: claude-docker),
-#              CLAUDE_DOCKER_VOLUME (one config volume for every mount set;
-#              shares state between them)
 set -euo pipefail
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 die() { echo "claude-docker: $*" >&2; exit 1; }
+warn() { echo "claude-docker: $*" >&2; }
 need_arg() { [ $# -ge 2 ] || die "$1 requires an argument"; }
 
 # resolve PATH: print PATH as an absolute path with all symlinks resolved.
@@ -91,12 +55,99 @@ no_symlinks_below() {
 
 sha256() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
 
+# label CONTAINER KEY: print a label of an existing container.
+label() { docker container inspect -f "{{index .Config.Labels \"$2\"}}" "$1"; }
+
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 script_dir="$(dirname "$(resolve "$script")")"
+if [ -n "${CLAUDE_DOCKER_DIR:-}" ]; then
+  [ -d "$CLAUDE_DOCKER_DIR" ] || die "CLAUDE_DOCKER_DIR is not a directory: $CLAUDE_DOCKER_DIR"
+  script_dir="$(cd "$CLAUDE_DOCKER_DIR" && pwd -P)"
+fi
 image="${CLAUDE_DOCKER_IMAGE:-claude-docker}"
 passthrough_env="ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN
   ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL"
+folder="$(pwd -P)"
 
+# ---------------------------------------------------------------------------
+# Parse options. Mounts are only collected here and validated later, because
+# they are ignored when the folder's container already exists.
+mount_specs=()     # "mode spec" pairs from -r/-w, in order
+mounts_files=()
+env_args=()
+claude_args=()
+ignored_args=()    # every argument except --shell, for the "ignored" warning
+workdir=/workspace
+name=""
+build=false
+no_cache=false
+shell=false
+ephemeral=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --shell) shell=true; shift; continue ;;
+    --) ignored_args+=("$@") ;;
+    -r|--ro|-w|--rw|-m|--mounts|-C|--workdir|-e|--env|-n|--name)
+      need_arg "$@"; ignored_args+=("$1" "$2") ;;
+    *) ignored_args+=("$1") ;;
+  esac
+  case "$1" in
+    -r|--ro) mount_specs+=(ro "$2"); shift 2 ;;
+    -w|--rw) mount_specs+=(rw "$2"); shift 2 ;;
+    -m|--mounts) mounts_files+=("$2"); shift 2 ;;
+    -C|--workdir) workdir="$2"; shift 2 ;;
+    -e|--env) env_args+=(-e "$2"); shift 2 ;;
+    -n|--name) name="$2"; shift 2 ;;
+    --rm) ephemeral=true; shift ;;
+    --build) build=true; shift ;;
+    --no-cache) no_cache=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; claude_args+=("$@"); break ;;
+    *) die "unknown option: $1 (see --help)" ;;
+  esac
+done
+
+# Per-session settings: terminal and auth/environment from the host.
+session_args=()
+if [ -t 0 ] && [ -t 1 ]; then session_args+=(-it); else session_args+=(-i); fi
+for var in $passthrough_env; do
+  if [ -n "${!var:-}" ]; then session_args+=(-e "$var"); fi
+done
+if [ -f "$script_dir/.env" ]; then session_args+=(--env-file "$script_dir/.env"); fi
+
+# ---------------------------------------------------------------------------
+# Reuse the folder's container if it has one (unless --rm).
+if ! $ephemeral; then
+  existing="$(docker ps -a --filter "label=claude-docker.folder=$folder" --format '{{.Names}}' | head -n 1)"
+  if [ -n "$existing" ]; then
+    if [ ${#ignored_args[@]} -gt 0 ]; then
+      warn "this folder already has container '$existing'; ignoring: ${ignored_args[*]}"
+      warn "to apply them, remove it first (docker rm -f $existing) or use --rm for a one-off container"
+    fi
+    if [ "$(docker container inspect -f '{{.Image}}' "$existing")" != \
+         "$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)" ]; then
+      warn "note: '$existing' uses an older '$image' image; remove it (docker rm -f $existing) to switch"
+    fi
+    if $shell; then
+      cmd=(bash)
+    else
+      cmd=(claude)
+      while IFS= read -r arg; do
+        [ -z "$arg" ] || cmd+=("$arg")
+      done <<< "$(label "$existing" claude-docker.claude-args)"
+    fi
+    if [ "$(docker container inspect -f '{{.State.Running}}' "$existing")" != true ]; then
+      docker start "$existing" >/dev/null
+    fi
+    warn "using container '$existing'"
+    exec docker exec -w "$(label "$existing" claude-docker.workdir)" \
+      "${session_args[@]}" "$existing" "${cmd[@]}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Create a new container from the options given.
 mount_args=()
 mount_srcs=()   # host paths, symlinks resolved
 mount_given=()  # host paths as given (absolute, symlinks not resolved)
@@ -104,19 +155,9 @@ mount_dests=()
 mount_modes=()
 mount_dirs=()
 mount_summary=()
-mounts_files=()
 # Host paths a container must not be able to write: this script (and the path
 # it was invoked by) and its directory, plus the mounts files in use.
 protected_paths=("$script_dir" "$script")
-env_args=()
-claude_args=()
-workdir=/workspace
-name=""
-build=false
-no_cache=false
-shell=false
-recreate=false
-ephemeral=false
 
 # add_mount MODE PATH[:DEST] [BASE_DIR]
 # Relative PATHs resolve against BASE_DIR (default: the current directory).
@@ -177,7 +218,7 @@ read_mounts_file() {
   done < "$file"
 }
 
-# Hash of the mount set, used to name its config volume and container.
+# Hash of the mount set, used to name its config volume.
 mount_set_hash() {
   local i
   for ((i = 0; i < ${#mount_srcs[@]}; i++)); do
@@ -185,26 +226,10 @@ mount_set_hash() {
   done | LC_ALL=C sort | sha256 | cut -c1-12
 }
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -r|--ro) need_arg "$@"; add_mount ro "$2"; shift 2 ;;
-    -w|--rw) need_arg "$@"; add_mount rw "$2"; shift 2 ;;
-    -m|--mounts) need_arg "$@"; mounts_files+=("$2"); shift 2 ;;
-    -C|--workdir) need_arg "$@"; workdir="$2"; shift 2 ;;
-    -e|--env) need_arg "$@"; env_args+=(-e "$2"); shift 2 ;;
-    -n|--name) need_arg "$@"; name="$2"; shift 2 ;;
-    --shell) shell=true; shift ;;
-    --recreate) recreate=true; shift ;;
-    --rm) ephemeral=true; shift ;;
-    --build) build=true; shift ;;
-    --no-cache) no_cache=true; shift ;;
-    -h|--help) usage; exit 0 ;;
-    --) shift; claude_args+=("$@"); break ;;
-    *) die "unknown option: $1 (see --help)" ;;
-  esac
+for ((i = 0; i < ${#mount_specs[@]}; i += 2)); do
+  add_mount "${mount_specs[i]}" "${mount_specs[i + 1]}"
 done
-
-if [ ${#mount_args[@]} -eq 0 ] && [ ${#mounts_files[@]} -eq 0 ] && [ -f "$script_dir/mounts.conf" ]; then
+if [ ${#mount_specs[@]} -eq 0 ] && [ ${#mounts_files[@]} -eq 0 ] && [ -f "$script_dir/mounts.conf" ]; then
   mounts_files=("$script_dir/mounts.conf")
 fi
 for f in ${mounts_files[@]+"${mounts_files[@]}"}; do
@@ -238,32 +263,40 @@ for ((i = 0; i < ${#mount_srcs[@]}; i++)); do
   done
 done
 
-mounts_hash="$(mount_set_hash)"
-
 # One config volume per mount set: hooks, settings or MCP servers a session
 # writes there only reach later sessions with the same access.
-volume="${CLAUDE_DOCKER_VOLUME:-claude-docker-config-$mounts_hash}"
-
-if [ -z "$name" ]; then
-  if $ephemeral; then name="claude-$(date +%Y%m%d-%H%M%S)"; else name="claude-$mounts_hash"; fi
-fi
+volume="${CLAUDE_DOCKER_VOLUME:-claude-docker-config-$(mount_set_hash)}"
 
 case "$workdir" in /*) ;; *) workdir="/workspace/$workdir" ;; esac
 [ "$workdir" = "/" ] || workdir="${workdir%/}"
+
+# claude's arguments: --add-dir for mounts outside the working directory, then
+# anything after `--`. Stored on the container so later sessions reuse them.
+claude_cmd_args=()
+for d in ${mount_dirs[@]+"${mount_dirs[@]}"}; do
+  case "$d/" in "${workdir%/}/"*) ;; *) claude_cmd_args+=(--add-dir "$d") ;; esac
+done
+claude_cmd_args+=(${claude_args[@]+"${claude_args[@]}"})
 
 if $shell; then
   [ ${#claude_args[@]} -eq 0 ] || die "arguments after -- are for claude and can't be combined with --shell"
   cmd=(bash)
 else
-  cmd=(claude)
-  for d in ${mount_dirs[@]+"${mount_dirs[@]}"}; do
-    case "$d/" in "${workdir%/}/"*) ;; *) cmd+=(--add-dir "$d") ;; esac
-  done
-  cmd+=(${claude_args[@]+"${claude_args[@]}"})
+  cmd=(claude ${claude_cmd_args[@]+"${claude_cmd_args[@]}"})
+fi
+
+if [ -z "$name" ]; then
+  if $ephemeral; then
+    name="claude-$(date +%Y%m%d-%H%M%S)"
+  else
+    base_name="$(basename "$folder" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/-*$//')"
+    name="claude-${base_name:-root}-$(printf '%s' "$folder" | sha256 | cut -c1-8)"
+  fi
 fi
 
 if $build; then
-  build_args=(-t "$image")
+  [ -f "$script_dir/Dockerfile" ] || die "no Dockerfile in $script_dir. If $script is a copy, replace it with a symlink to claude-docker.sh or set CLAUDE_DOCKER_DIR to the directory that holds the Dockerfile"
+  build_args=(-t "$image" -f "$script_dir/Dockerfile")
   # Match the host user so bind-mount writes are owned correctly on Linux.
   if [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 0 ]; then
     build_args+=(--build-arg "USER_UID=$(id -u)" --build-arg "USER_GID=$(id -g)")
@@ -273,7 +306,7 @@ if $build; then
   elif docker image inspect "$image" >/dev/null 2>&1; then
     build_args+=(--quiet)
   fi
-  echo "claude-docker: building image '$image'..." >&2
+  warn "building image '$image'..."
   docker build "${build_args[@]}" "$script_dir" >/dev/null
 fi
 
@@ -281,59 +314,31 @@ fi
 # runaway process trees from starving the Docker VM.
 container_args=(--init --name "$name" -w "$workdir" -v "$volume:/home/node/.claude"
   --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=1024
-  --label "claude-docker.mounts=$mounts_hash")
+  ${env_args[@]+"${env_args[@]}"} ${mount_args[@]+"${mount_args[@]}"})
 
-# Per-session settings: terminal, working directory and environment.
-session_args=()
-if [ -t 0 ] && [ -t 1 ]; then session_args+=(-it); else session_args+=(-i); fi
-for var in $passthrough_env; do
-  if [ -n "${!var:-}" ]; then session_args+=(-e "$var"); fi
-done
-if [ -f "$script_dir/.env" ]; then session_args+=(--env-file "$script_dir/.env"); fi
-session_args+=(${env_args[@]+"${env_args[@]}"})
-
-print_mounts() {
-  if [ ${#mount_summary[@]} -gt 0 ]; then
-    echo "claude-docker: $1 '$name' with mounts:" >&2
-    printf '%s\n' "${mount_summary[@]}" >&2
-  else
-    echo "claude-docker: $1 '$name' with no host mounts (see --help)" >&2
-  fi
-  echo "claude-docker: config volume '$volume'" >&2
-}
-
-# One-off container, removed on exit
 if $ephemeral; then
-  print_mounts "starting one-off container"
-  exec docker run --rm "${container_args[@]}" "${session_args[@]}" \
-    ${mount_args[@]+"${mount_args[@]}"} "$image" "${cmd[@]}"
-fi
-
-container_exists() { docker container inspect "$name" >/dev/null 2>&1; }
-
-if container_exists && $recreate; then
-  echo "claude-docker: removing container '$name'..." >&2
-  docker rm -f "$name" >/dev/null
-fi
-
-if container_exists; then
-  # Mounts are fixed at creation, so only reuse a container with the same set.
-  existing="$(docker container inspect -f '{{index .Config.Labels "claude-docker.mounts"}}' "$name")"
-  [ "$existing" = "$mounts_hash" ] ||
-    die "container '$name' exists with a different mount set; pass --recreate to replace it or -n to use another name"
-  if [ "$(docker container inspect -f '{{.Image}}' "$name")" != "$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null)" ]; then
-    echo "claude-docker: note: '$name' uses an older '$image' image; pass --recreate to switch to the new one" >&2
-  fi
-  echo "claude-docker: using existing container '$name'" >&2
+  what="starting one-off container"
 else
-  print_mounts "creating container"
-  # A placeholder main process keeps the container running between sessions.
-  docker create --restart unless-stopped "${container_args[@]}" \
-    ${mount_args[@]+"${mount_args[@]}"} "$image" sleep infinity >/dev/null
+  what="creating container"
+fi
+if [ ${#mount_summary[@]} -gt 0 ]; then
+  warn "$what '$name' with mounts:"
+  printf '%s\n' "${mount_summary[@]}" >&2
+else
+  warn "$what '$name' with no host mounts (see --help)"
+fi
+warn "config volume '$volume'"
+
+if $ephemeral; then
+  exec docker run --rm "${container_args[@]}" "${session_args[@]}" "$image" "${cmd[@]}"
 fi
 
-if [ "$(docker container inspect -f '{{.State.Running}}' "$name")" != true ]; then
-  docker start "$name" >/dev/null
-fi
-
+# A placeholder main process keeps the container running between sessions.
+# The labels let later runs in this folder find it and start claude the same way.
+docker create --restart unless-stopped "${container_args[@]}" \
+  --label "claude-docker.folder=$folder" \
+  --label "claude-docker.workdir=$workdir" \
+  --label "claude-docker.claude-args=$(printf '%s\n' ${claude_cmd_args[@]+"${claude_cmd_args[@]}"})" \
+  "$image" sleep infinity >/dev/null
+docker start "$name" >/dev/null
 exec docker exec -w "$workdir" "${session_args[@]}" "$name" "${cmd[@]}"
